@@ -1,0 +1,7 @@
+clicktext:Connected devices
+sleep:1
+checkimage:E:/work/GFXTest/icon/pic/wiko_settings_4_Connect_Bluetooth.720x1512.png
+checkimage:E:/work/GFXTest/icon/pic/wiko_settings_4_Connect_Cast.720x1512.png
+checkimage:E:/work/GFXTest/icon/pic/wiko_settings_4_Connect_Printing.720x1512.png
+checkimage:E:/work/GFXTest/icon/pic/wiko_settings_4_Connect_USB.720x1512.png
+pressback:1

@@ -1,0 +1,1886 @@
+﻿﻿#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+'''
+  当渲染时间大于16.67，按照垂直同步机制，该帧就已经渲染超时
+  那么，如果它正好是16.67的整数倍，比如66.68，则它花费了4个垂直同步脉冲，减去本身需要一个，则超时3个
+  如果它不是16.67的整数倍，比如67，那么它花费的垂直同步脉冲应向上取整，即5个，减去本身需要一个，即超时4个，可直接算向下取整
+
+  最后的计算方法思路：
+  执行一次命令，总共收集到了m帧（理想情况下m=128），但是这m帧里面有些帧渲染超过了16.67毫秒，算一次jank，一旦jank，
+  需要用掉额外的垂直同步脉冲。其他的就算没有超过16.67，也按一个脉冲时间来算（理想情况下，一个脉冲就可以渲染完一帧）
+
+  所以FPS的算法可以变为：
+  m / （m + 额外的垂直同步脉冲） * 60
+  '''
+import Queue
+import collections
+import datetime
+import hashlib
+import os
+import random
+import re
+import signal
+import subprocess
+import sys
+import thread
+import xml.dom.minidom
+from optparse import OptionParser, OptionGroup
+from subprocess import Popen, PIPE
+
+from uiautomator import Device
+
+import MinicapMin
+from lib.imcp.mixin import DeviceMixin
+from myocr import MYOCRTest
+
+UINode = collections.namedtuple('UINode', [
+    'xml',
+    'bounds',
+    'selected', 'checkable', 'clickable', 'scrollable', 'focusable', 'enabled', 'focused', 'long_clickable',
+    'password',
+    'class_name',
+    'index', 'resource_id',
+    'text', 'content_desc',
+    'package'])
+__boundstuple = collections.namedtuple('Bounds', ['left', 'top', 'right', 'bottom'])
+FindPoint = collections.namedtuple('FindPoint', ['pos', 'confidence', 'method', 'matched'])
+
+import threading
+import time
+
+
+# class Job(threading.Thread):
+#     def __init__(self, *args, **kwargs):
+#         super(Job, self).__init__(*args, **kwargs)
+#         self.__flag = threading.Event()  # 用于暂停线程的标识
+#         self.__flag.set()  # 设置为True
+#         self.__running = threading.Event()  # 用于停止线程的标识
+#         self.__running.set()  # 将running设置为True
+#         self.pkg = args.
+#
+#     def run(self):
+#         a=GFXTest()
+#         a.travel2()
+#         while self.__running.isSet():
+#             self.__flag.wait()  # 为True时立即返回, 为False时阻塞直到内部的标识位为True后返回
+#
+#     def pause(self):
+#         self.__flag.clear()  # 设置为False, 让线程阻塞
+#
+#     def resume(self):
+#         self.__flag.set()  # 设置为True, 让线程停止阻塞
+#
+#     def stop(self):
+#         self.__flag.set()  # 将线程从暂停状态恢复, 如何已经暂停的话
+#         self.__running.clear()  # 设置为False
+#
+
+class Bounds(__boundstuple):
+    def __init__(self, *args, **kwargs):
+        self._area = None
+
+    def is_inside(self, x, y):
+        v = self
+        return x > v.left and x < v.right and y > v.top and y < v.bottom
+
+    @property
+    def area(self):
+        if not self._area:
+            v = self
+            self._area = (v.right - v.left) * (v.bottom - v.top)
+        return self._area
+
+    @property
+    def center(self):
+        v = self
+        return (v.left + v.right) / 2, (v.top + v.bottom) / 2
+
+    def __mul__(self, mul):
+        return Bounds(*(int(v * mul) for v in self))
+
+
+class MyLogger(type(sys)):
+    '''
+    This class is used for printing colorful log
+    '''
+    DEBUG = 10
+    INFO = 20
+    WARNING = 30
+    ERROR = 40
+    CRITICAL = 50
+    # NOTSET = 0
+    WINDOWS_STD_OUT_HANDLE = -11
+    GREEN_COLOR = 2
+    RED_COLOR = 4
+    YELLOW_COLOR = 6
+    WHITE_COLOR = 7
+
+    def __init__(self, *args, **kwargs):
+        self.level = self.__class__.INFO
+        self.output = "log_" + time.strftime("%m-%d-%H-%M",
+                                             time.localtime()) + ".txt"
+
+    # def __set_color(self, color):
+    #     out_handler = ctypes.windll.kernel32.GetStdHandle(self.__class__.WINDOWS_STD_OUT_HANDLE)
+    #     ctypes.windll.kernel32.SetConsoleTextAttribute(out_handler, color)
+
+    def __log(self, level, fmt, *args, **kwargs):
+        sys.stderr.write(
+            '{0} {1} {2}\n'.format(level, time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()), fmt % args))
+        if level >= self.level and self.output is not None:
+            with open(self.output, 'a') as f:
+                f.write('{0} {1} {2}\n'.format(level, time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()), fmt % args))
+
+    def format(color, level):
+        def wrapped(func):
+            def log(self, fmt, *args, **kwargs):
+                # self.__set_color(color)
+                self.__log(level, fmt, *args, **kwargs)
+                # self.__set_color(self.__class__.WHITE_COLOR)
+
+            return log
+
+        return wrapped
+
+    def config(self, *args, **kwargs):
+        if 'outfile' in kwargs:
+            self.output = kwargs['outfile']
+
+        if 'level' in kwargs:
+            self.level = kwargs['level']
+        else:
+            self.level = int(kwargs.get('level', self.__class__.INFO))
+
+    @format(GREEN_COLOR, 'DEBUG')
+    def debug(self, fmt, *args, **kwargs):
+        pass
+
+    @format(WHITE_COLOR, 'INFO')
+    def info(self, fmt, *args, **kwargs):
+        pass
+
+    @format(YELLOW_COLOR, 'WARNING')
+    def warning(self, fmt, *args, **kwargs):
+        pass
+
+    @format(RED_COLOR, 'ERROR')
+    def error(self, fmt, *args, **kwargs):
+        pass
+
+    @format(RED_COLOR, 'CRITICAL')
+    def critical(self, fmt, *args, **kwargs):
+        pass
+
+
+class GFXTest():
+    def __init__(self):
+        arg_parser = self.setup_arg_parser()
+        (self.options, self.args) = arg_parser.parse_args()
+        self.logger = MyLogger()
+        self.q1 = Queue.Queue(0)
+        if self.options.campaign_name == "":
+            self.options.campaign_name = "fps"
+        elif (self.options.campaign_name != "start") & (self.options.campaign_name != "fps"):
+            self.options.campaign_name = "fps"
+        self.flag = True
+        self.campaign = self.options.campaign_name
+        self.serial = self.options.serial_number
+        self.package = self.options.test_package
+        self.activity = self.options.pkg_activity
+        self.screensave = self.options.screen_save
+        self.xy = self.options.screen_xy
+        self.scroll_xy = self.options.scrool_xy
+        self.platfrom_fps = self.options.platfrom_fps
+        self.cpu_flag = True
+        # self.device_control = self.options.device_control
+        if (self.serial == "") | (len(self.getAdb())) == 1:
+            self.serial = self.getAdb()[0]
+            self.options.serial_number = self.serial
+        self.installbundle()
+
+        if (self.package == ""):
+            self.package = self.getPackage()
+        if self.scroll_xy == "r" and self.screensave == "3":
+            self.screensave = 10
+        if self.scroll_xy == "p" and self.screensave == "3":
+            self.screensave = 1
+        self.apkversion, self.buildversion = self.getAPKVersion()
+        self.fps_ave = 0
+        size = self.screenSize()
+        self.WIDTH = int(size[0])
+        self.HEIGHT = int(size[1])
+        self.mem = ""
+        self.cpu = ""
+        self.cpu_max = []
+        self.md5list = []
+        self.cpu_flag = True
+        self.q = Queue.Queue(0)
+
+        self.killmonkey()
+        self.enableFPS = self.options.enable_fps
+        self.d = Device(self.serial)
+        self.dm = DeviceMixin(self.d)
+
+    def getLog(self, pkg):
+        try:
+            # out = self.raw_cmd('wait-for-device', 'shell', 'logcat', '-c',stdout=subprocess.PIPE)
+            out = self.raw_cmd('wait-for-device', 'shell',
+                               'logcat -d |grep -A 1 -E \"FATAL EXCEPTION|ANR in|CRASH:|NOT RESPONDING\"')
+            outline = out.split("\r\n")
+            find_crash = False
+            tomstones = self.raw_cmd('wait-for-device', 'shell',
+                                     'ls -r /data/tombstones/tombstone_*|head -n 1', shell=True)
+
+            if len(tomstones) > 0:
+                tomstone = re.sub("\D", "", tomstones).replace("0", "")
+                # self.writeinit(os.getcwd() + '/' + str(s) + '.ini', "NE", "Tombstone", tomstone)
+                self.logger.info("<" + pkg + ">" + " < Tombstone:" + str(tomstone) + " >")
+                print str(self.serial) + "-> [TOMSTONES]: " + str(tomstone)
+            for i in outline:
+                if ("UiAutomation" in i) or ("ADB_SERVICES" in i):
+                    continue
+                if ("FATAL EXCEPTION" in i) or ("CRASH:" in i):
+                    find_crash = True
+                    continue
+                if find_crash:
+                    find_crash = False
+                    start = i.find("com")
+                    end = i.find(',')
+                    package = i[start:end].strip()
+                    if " " in package:
+                        package = package.split()[0]
+                    pid = i[i.find("PID:"):].strip()
+                    # print "<" + str(self.serial) + "> " + package + "-> [CRASH]: " + i
+                    # readini = self.readinit(os.getcwd() + '/' + str(s) + '.ini', "CRASH", package)
+                    # if "NONE" == readini:
+                    #     self.writeinit(os.getcwd() + '/' + str(s) + '.ini', "CRASH", package, 1)
+                    # elif readini.isdigit():
+                    #     readini = int(readini) + 1
+                    #     self.writeinit(os.getcwd() + '/' + str(s) + '.ini', "CRASH", package, readini)
+                    self.logger.info("<" + pkg + ">" + " < CRASH:" + str(i) + " >")
+                if ("ANR in" in i) or ("NOT RESPONDING:" in i):
+                    start = i.find("com")
+                    package = i[start:].strip()
+                    # readini = self.readinit(os.getcwd() + '/' + str(s) + '.ini', "ANR", package)
+                    print "<" + str(self.serial) + "> " + package + "-> [ANR]: " + i
+                    if " " in package:
+                        package = package.split()[0]
+                        # if "NONE" == readini:
+                        #     self.writeinit(os.getcwd() + '/' + str(s) + '.ini', "ANR", package, 1)
+                        # elif readini.isdigit():
+                        #     readini = int(readini) + 1
+                        #     self.writeinit(os.getcwd() + '/' + str(s) + '.ini', "ANR", package, readini)
+                        #     # self.writeinit()
+                    self.logger.info("<" + pkg + ">" + " < ANR:" + str(i) + " >")
+        except Exception, e:
+            pass
+        finally:
+            out = self.raw_cmd('wait-for-device', 'shell', 'logcat', '-c')
+
+    def installbundle(self):
+        # self.killsh()
+        self.raw_cmd('wait-for-device', 'shell', 'dumpsys', 'SurfaceFlinger  --latency-clear')
+        # out1 = self.raw_cmd('wait-for-device', 'shell','ls','/data/local/tmp/bundle.jar')
+        out1 = subprocess.check_output(
+            "adb -s " + self.serial + " wait-for-device shell ls /data/local/tmp/bundle.jar; exit 0",
+            stderr=subprocess.STDOUT, shell=True)
+        if "No such" in out1:
+            self.raw_cmd('wait-for-device', 'push', os.getcwd() + '/lib/bundle/bundle.jar', '/data/local/tmp/')
+            out = self.raw_cmd('wait-for-device', 'shell', 'ls /data/local/tmp/bundle.jar')
+            time.sleep(1)
+        out = subprocess.check_output(
+            "adb -s " + self.serial + " wait-for-device shell ls /data/local/tmp/uiautomator-stub.jar; exit 0",
+            stderr=subprocess.STDOUT, shell=True)
+        if "No such" in out:
+            self.raw_cmd('wait-for-device', 'push', os.getcwd() + '/lib/bundle/uiautomator-stub.jar',
+                         '/data/local/tmp/')
+            time.sleep(1)
+        out = subprocess.check_output(
+            "adb -s " + self.serial + " wait-for-device shell ls /data/local/tmp/busybox; exit 0",
+            stderr=subprocess.STDOUT, shell=True)
+        if "No such" in out:
+            out = self.raw_cmd('wait-for-device', 'push', os.getcwd() + '/lib/bundle/busybox', '/data/local/tmp/')
+            time.sleep(1)
+        print "install test app,please wait..."
+
+        outinstall = self.raw_cmd('wait-for-device', 'shell', 'pm', 'list', 'package', ' com.github.uiautomator')
+        if "com.github.uiautomator" not in outinstall:
+            self.raw_cmd('wait-for-device', 'install', '-r', os.getcwd() + '/lib/bundle/app.apk')
+
+        outinstallest = self.raw_cmd('wait-for-device', 'shell', 'pm', 'list', 'package', 'com.github.uiautomator.test')
+        if "com.github.uiautomator.test" not in outinstallest:
+            out = self.raw_cmd('wait-for-device', 'install', '-r', os.getcwd() + '/lib/bundle/app-test.apk')
+            time.sleep(1)
+
+        if "r" == self.scroll_xy or "p" == self.scroll_xy:
+            out = subprocess.check_output(
+                "adb -s " + self.serial + " wait-for-device shell ls /data/local/tmp/eventrec; exit 0",
+                stderr=subprocess.STDOUT, shell=True)
+            if "No such" in out:
+                self.raw_cmd('wait-for-device', 'push', os.getcwd() + '/lib/bundle/eventrec', '/data/local/tmp/')
+                time.sleep(1)
+                self.raw_cmd('wait-for-device', 'shell', 'chmod', '777', '/data/local/tmp/eventrec')
+        out = self.raw_cmd('wait-for-device', 'push', os.getcwd() + '/lib/bundle/fps.sh', '/data/local/tmp/')
+        out = self.raw_cmd('wait-for-device', 'shell', 'chmod 777 /data/local/tmp/busybox')
+        out = self.raw_cmd('wait-for-device', 'shell', 'chmod 777 /data/local/tmp/fps.sh')
+
+    def screenSize(self):
+        out = self.raw_cmd('wait-for-device', 'shell', 'wm', 'size')
+        out = out.split()[-1].split("x")
+        return out
+
+    def getPackage(self):
+        out = self.shell_cmd('getprop ro.build.version.sdk')
+        sdk = int(out.strip())
+        if sdk < 26:
+            getp = self.shell_cmd('dumpsys activity |grep mFocusedActivity')
+        else:
+            getp = self.shell_cmd('dumpsys activity |grep mResumedActivity')
+        # out = self.raw_cmd('wait-for-device', 'shell', 'ps', '|grep', 'minicap')
+        start = getp.find("com")
+        end = getp.find('/')
+        package = getp[start:end].strip()
+        # apkversion = self.raw_cmd('wait-for-device', 'shell', 'dumpsys', "package", package, "|", "grep",'versionName', '|head -n 1')
+        return package
+
+    def getAPKVersion(self):
+        buildversion = ""
+        apkversion = ""
+        buildversion = \
+            self.raw_cmd('wait-for-device', 'shell', 'getprop', 'ro.custom.build.version').strip()
+        apkversion = \
+            self.raw_cmd('wait-for-device', 'shell', 'dumpsys', "package", self.package, "|", "grep", 'versionName')
+        if "versionName=" in apkversion:
+            apkversion = apkversion.replace("versionName=", "").strip().split()[0]
+        return apkversion, buildversion
+
+    def getActivity(self):
+        out = self.raw_cmd('wait-for-device', 'shell', 'getprop', 'ro.build.version.sdk')
+        sdk = int(out.strip())
+        if sdk < 26:
+            getp = self.raw_cmd('wait-for-device', 'shell', 'dumpsys', 'activity', '|grep', 'mFocusedActivity')
+        else:
+            getp = self.raw_cmd('wait-for-device', 'shell', 'dumpsys', 'activity', '|grep', 'mResumedActivity')
+        # out = self.raw_cmd('wait-for-device', 'shell', 'ps', '|grep', 'minicap')
+        start = getp.find("com")
+        end = getp.find('/')
+        package = getp[start:end].strip()  # "com.android.settings"
+        endactivty = getp[start:].strip()  # "com.android.setings/.abcdef xyszn"
+        endactivty1 = endactivty.find(" ")  #
+        aend = endactivty[:endactivty1].strip("\r\n")  # "com.android.setings/.abcdef"
+
+        if "/." in aend:
+            activity = aend.replace("/.", "/" + package + ".")
+        return activity
+
+    def setup_arg_parser(self):
+        usage = "usage: %prog -c TEST_CAMPAIGN [OPTIONS]"
+        parser = OptionParser(usage=usage)
+        mandatory_group = OptionGroup(parser, "MANDATORIES")
+
+        mandatory_group.add_option("-c",
+                                   metavar=u"fps或者start启动时间",
+                                   default="fps",
+                                   dest="campaign_name")
+        parser.add_option_group(mandatory_group)
+        optional_group = OptionGroup(parser, "OPTIONS")
+        optional_group.add_option("-s",
+                                  metavar=u"123456 |设备号,只有1个设备时无需设置|",
+                                  default="",
+                                  dest="serial_number")
+
+        optional_group.add_option("-p",
+                                  metavar=u"com.android.settings |测试包名,默认当前窗口|",
+                                  default="",
+                                  dest="test_package")
+
+        optional_group.add_option("-t",
+                                  metavar=u"5 |截图时间默认3秒|",
+                                  default="3",
+                                  dest="screen_save")
+
+        optional_group.add_option("-x",
+                                  metavar=u"200x300 |点击点xy坐标|",
+                                  default="",
+                                  dest="screen_xy")
+
+        optional_group.add_option("-a",
+                                  metavar=u"com.android.settings/com.android.settings.Settings  |包名全称|",
+                                  default="",
+                                  dest="pkg_activity")
+
+        optional_group.add_option("-d",
+                                  metavar=u"v |滑动方向,h 水平 v 垂直 m 手动 默认v r 录制 p 回放|",
+                                  default="v",
+                                  dest="scrool_xy")
+
+        optional_group.add_option("-u",
+                                  metavar=u"图形界面",
+                                  default="n",
+                                  dest="gfxtest_gui")
+
+        optional_group.add_option("-r",
+                                  metavar=u"y |流畅度整机测试,默认n|",
+                                  default="n",
+                                  dest="platfrom_fps")
+
+        optional_group.add_option("-g",
+                                  metavar=u"g |不测FPS，用于提高其他测试的性能|",
+                                  default="y",
+                                  dest="enable_fps")
+
+        parser.add_option_group(optional_group)
+        return parser
+
+    def raw_cmdThread(self, process):
+        start = datetime.datetime.now()
+        while process.poll() is None:
+            time.sleep(1)
+            now = datetime.datetime.now()
+            if (now - start).seconds > 15:
+                os.kill(process.pid, signal.SIGTERM)
+                self.q1.put("None")
+        self.q1.put(process.stdout.readlines())
+
+    def raw_cmd(self, *args):
+        try:
+            timeout = 15
+            Returncode = "over"
+            cmds = ['adb'] + ['-s'] + [self.serial] + list(args)
+            p = subprocess.Popen(cmds, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            c = p.communicate()[0]
+            return c
+        except Exception, e:
+            pass
+
+    def getAdb(self):
+        try:
+            serial = []
+            p = Popen("adb devices", shell=True, stdout=PIPE, stderr=PIPE)
+            serial = p.stdout.readlines()
+            if len(serial) == 3:
+                serial = serial[1:-1]
+                for i in range(len(serial)):
+                    serial[i] = serial[i].replace("\t", "")
+                    serial[i] = serial[i].replace("\n", "")
+                    serial[i] = serial[i].replace("\r", "")
+                    serial[i] = serial[i].replace("\r", "")
+                    serial[i] = serial[i].replace("device", "")
+                return serial
+            elif len(serial) == 2:
+                print "Device not found!"
+                sys.exit(1)
+            elif len(serial) >= 4:
+                if self.options.serial_number == "":
+                    print u"发现多个设备，请使用 -s xxx 参数指定xxx设备序列号！"
+                    sys.exit(1)
+                else:
+                    self.serial = self.options.serial_number
+                return self.serial
+        except Exception, e:
+            print "Device not found!"
+            sys.exit(1)
+
+    def monkeythread(self):
+        try:
+            self.killmonkey()
+            self.raw_cmd('wait-for-device', 'shell', 'monkey', '-p', str(self.package),
+                         '--pct-touch 40 --pct-motion 30 --pct-pinchzoom 30', '--throttle', '1000', '-s', '1',
+                         '--ignore-security-exceptions',
+                         '--ignore-crashes', '--ignore-timeouts', '--ignore-native-crashes', '-v', '100',
+                         '>/dev/null')
+        except Exception, e:
+            return False
+
+    def removeFileInFirstDir(self, targetDir):
+        for file in os.listdir(targetDir):
+            targetFile = os.path.join(targetDir, file)
+            if os.path.isfile(targetFile):
+                os.remove(targetFile)
+
+    def swiptDown(self):
+        self.shell_cmd(
+            'input swipe ' + str(self.WIDTH / 2) + " " + str(self.HEIGHT * 0.7) + " " + str(self.WIDTH / 2) + " " + str(
+                self.HEIGHT * 0.2))
+
+    def swiptUp(self):
+        self.shell_cmd(
+            'input swipe ' + str(self.WIDTH / 2) + " " + str(self.HEIGHT * 0.2) + " " + str(self.WIDTH / 2) + " " + str(
+                self.HEIGHT * 0.7))
+
+    def swiptRight(self):
+        self.shell_cmd(
+            'input swipe ' + str(self.WIDTH - 50) + " " + str(self.HEIGHT / 2) + " 50 " + str(self.HEIGHT / 2))
+
+    def swiptLeft(self):
+        self.shell_cmd(
+            'input swipe  50 ' + str(self.HEIGHT / 2) + " " + str(self.WIDTH - 50) + " " + str(self.HEIGHT / 2))
+
+    def screenShot(self, path):
+        self.raw_cmd('wait-for-device', 'shell', 'screencap', '/sdcard/tmp.png')
+        time.sleep(1)
+        self.raw_cmd('wait-for-device', 'pull', '/sdcard/tmp.png', str(path))
+        time.sleep(1)
+
+    def swipe2(self):
+        try:
+            results = self.raw_cmd('wait-for-device', 'shell', 'dumpsys', 'gfxinfo', self.package, 'reset')
+            if "systemui" in self.package:
+                # self.raw_cmd('wait-for-device', 'shell', 'input', 'keyevent 26')
+                # self.raw_cmd('wait-for-device', 'shell', 'input', 'keyevent 26').communicate()[
+                #     0]
+                # self.raw_cmd('wait-for-device', 'shell', 'input', 'keyevent 82').communicate()[
+                #     0]
+                # self.raw_cmd('wait-for-device', 'shell', 'input', 'swipe', str(self.WIDTH / 2), str(self.HEIGHT * 0.7),
+                #              str(self.WIDTH / 2), str(self.HEIGHT * 0.2))
+                self.raw_cmd('wait-for-device', 'shell', 'input', 'swipe', str(self.WIDTH / 2), "1",
+                             str(self.WIDTH / 2), str(self.HEIGHT * 0.7))
+                self.raw_cmd('wait-for-device', 'shell', 'input', 'swipe', str(self.WIDTH - 50), str(self.HEIGHT / 2),
+                             "50",
+                             str(self.HEIGHT / 2))
+                self.raw_cmd('wait-for-device', 'shell', 'input', 'swipe', str(self.WIDTH - 50), str(self.HEIGHT / 2),
+                             "50",
+                             str(self.HEIGHT / 2))
+                self.raw_cmd('wait-for-device', 'shell', 'input', 'keyevent 4').communicate()[0]
+            elif self.scroll_xy == "m":
+                pass
+            else:
+                if self.scroll_xy == "vh" or self.scroll_xy == "hv":
+                    self.swiptDown()
+                    self.swiptUp()
+                    self.swiptRight()
+                    self.swiptLeft()
+                elif self.scroll_xy == "v":
+                    self.swiptDown()
+                    self.swiptUp()
+                elif self.scroll_xy == "h":
+                    self.swiptRight()
+                    self.swiptLeft()
+        finally:
+            pass
+            self.screenShot(os.getcwd() + "/pic/" + self.package + str(datetime.datetime.now().second) + ".png")
+
+    def gfxclean(self):
+        results = self.raw_cmd('wait-for-device', 'shell', 'dumpsys', 'gfxinfo', self.package, 'reset')
+
+    def swipesystemui(self):
+        self.raw_cmd('wait-for-device', 'shell', 'input', 'swipe', str(self.WIDTH / 2), "1",
+                     str(self.WIDTH / 2), str(self.HEIGHT * 0.7))
+        self.raw_cmd('wait-for-device', 'shell', 'input', 'swipe', str(self.WIDTH - 50), str(self.HEIGHT / 2),
+                     "50",
+                     str(self.HEIGHT / 2))
+        self.raw_cmd('wait-for-device', 'shell', 'input', 'swipe', str(self.WIDTH - 50), str(self.HEIGHT / 2),
+                     "50",
+                     str(self.HEIGHT / 2))
+        self.raw_cmd('wait-for-device', 'shell', 'input', 'keyevent 4').communicate()[
+            0]
+
+    def gfxtest(self):
+        if "systemui" in self.package:
+            return self.gfxtest2()
+        else:
+            return self.gtest(self.package)
+
+    def gtest(self, pkg):
+        try:
+            my_re = re.compile(r'[A-Za-z]', re.S)
+            fps = 0
+            frame_count = 0
+            jank_count = 0
+            vsync_overtime = 0
+            draw_over = 0
+            render_time = []
+            draw_time = []
+            fps = 0
+            results = self.raw_cmd('wait-for-device', 'shell', 'dumpsys', 'gfxinfo', pkg)
+            pt = False
+            frames = []
+            for i in results.split("\r"):
+                if "Draw" in i and "Process" in i and "Execute" in i:
+                    pt = True
+                    j = 0
+                    continue
+                if pt and i != "":
+                    resw = re.findall(my_re, i)
+                    # if (j <= 120) & (i != "") & (len(i) > 1):
+                    if len(resw) == 0:
+                        frames.append(i.split())
+                    else:
+                        pt = False
+
+            for frame in frames:
+                if len(frame) == 4:
+                    try:
+                        if float(frame[0]) > (16.67):  # >16.67s
+                            draw_time.append('%.2f' % (float(frame[0])))
+                        rt = '%.2f' % (float(frame[0]) + float(frame[1]) + float(frame[2]) + float(frame[3]))
+                        render_time.append(rt)
+                    except Exception, e:
+                        render_time = [0]
+            frame_count = len(frames)
+            if len(render_time) > 1:
+                for j in render_time:
+                    if float(j) > 16.67:
+                        jank_count += 1
+                        if float(j) % 16.67 == 0:
+                            vsync_overtime += int(float(j) / 16.67) - 1
+                        else:
+                            vsync_overtime += int(float(j) / 16.67)
+                if frame_count > 0:
+                    fps = int(frame_count * 60 / (frame_count + vsync_overtime))
+                    draw_over = '%.2f' % (len(draw_time) / float(frame_count))
+                    # print "framecount=",frame_count,"fps_ave=",self.fps_ave,"fps=",fps,"vnc=",vsync_overtime
+                    # fps = self.fps_ave + fps
+                    # self.fps_ave = self.fps_ave / frame_count
+                    # print "Frames=", frame_count, " Jank=", jank_count, " FPS=", self.fps_ave, " Draw=",float(draw_over)*100
+        finally:
+            return int(frame_count), int(jank_count), int(fps), int(float(draw_over) * 100)
+
+    def gfxtest2(self):
+        try:
+            fps = 0
+            jank_count = 0
+            results = self.raw_cmd('wait-for-device', 'shell', 'dumpsys', 'gfxinfo', self.package)
+            frames = 0
+            for i in results.split("\r"):
+                if "Total frames rendered:" in i:
+                    # frames = i.replace("ms", "").split()[1:-1]
+                    frames = i.split()[3]
+                elif "Janky frames:" in i:
+                    # frames = i.replace("ms", "").split()[1:-1]
+                    jank_count = i.split()[2]
+                elif "Number Missed Vsync:" in i:
+                    # frames = i.replace("ms", "").split()[1:-1]
+                    mv = i.split()[3]
+            fps = int((int(frames) * 60) / (int(frames) + int(mv)))
+        finally:
+            return int(frames), int(jank_count), int(fps), 0
+
+    def testFPS2(self):
+        # self.killsh()
+        activity = self.getActivity()
+        persion = self.raw_cmd('wait-for-device', 'shell', 'getprop', 'ro.internal.build.version')
+        if "8.0" in persion:
+            thread.start_new_thread(
+                self.raw_cmd('wait-for-device', 'shell', 'sh /data/local/tmp/fps.sh -t 60 -w ' + activity + "#0",
+                             stdout=subprocess.PIPE), ("Thread-1", 2,))
+        else:
+            thread.start_new_thread(
+                self.raw_cmd('wait-for-device', 'shell', 'sh /data/local/tmp/fps.sh -t 60 -w ' + activity,
+                             stdout=subprocess.PIPE), ("Thread-1", 2,))
+
+    def testFPS(self):
+        try:
+            # d = threading.Thread(target=self.get_cpu, args=(self.package,)).start()
+            frame_count = 0
+            jank_count = 0
+            fps = 0
+            draw_over = 0
+            # self.raw_cmd('wait-for-device', 'shell', 'setprop', 'debug.hwui.profile', 'visual_bars',
+            #              stdout=subprocess.PIPE)  # visual_bars
+            # self.raw_cmd('wait-for-device', 'shell',
+            #              'monkey', '-p com.android.settings -c', 'android.intent.category.LAUNCHER', '1',
+            #              stdout=subprocess.PIPE )
+            # time.sleep(0.2)
+            # self.raw_cmd('wait-for-device', 'shell', 'input', 'keyevent', '4',
+            #              stdout=subprocess.PIPE)
+            # time.sleep(0.2)
+            if self.xy != "":
+                if self.xy.isalpha():
+                    # self.d(text=self.xy).click()
+                    pass
+                elif "x" in self.xy:
+                    self.raw_cmd('wait-for-device', 'shell', ' input', 'tap', str(self.xy.split("x")[0]),
+                                 str(self.xy.split("x")[1]))
+                    # self.d.click(int(self.xy.split("x")[0]), int(self.xy.split("x")[1]))
+                time.sleep(2)
+
+            i = 0
+            if self.scroll_xy == "m" or self.scroll_xy == "p" or self.scroll_xy == "pa":
+                if self.scroll_xy == "p":
+                    ref = raw_input("Input play file and press Enter ..: ")
+                    raw_input("Press Enter to start record screen ,and CTRL C to stop record.")
+                    for i in xrange(1, int(self.screensave) + 1):
+                        results = self.raw_cmd('wait-for-device', 'shell', 'dumpsys', 'gfxinfo', self.package, 'reset')
+                        print u"播放第%i 次中..." % i
+                        self.replay(ref)
+                        result = self.gfxtest()
+                        if (result[0] != 0) & (result[2] != 0):
+                            frame_count = frame_count + result[0]
+                            jank_count = jank_count + result[1]
+                            fps = int(fps + result[2])
+                            draw_over = (draw_over + result[3])
+                        print u"第" + str(i) + u"次帧速FPS: " + str(result[2]) + u" 绿色帧：" + str(
+                            result[3]) + "%" + u" 总帧数: " + str(result[0]) + u", 丢帧数: " + str(result[1])
+                        # self.screenShot(
+                        #     os.getcwd() + "/pic/" + self.package + str(datetime.datetime.now().second) + ".png")
+                    self.getLog(self.package)
+                elif self.scroll_xy == "pa":
+                    getfile = raw_input("Please input replay file name: ")
+                    if not os.path.isfile(os.getcwd() + "/" + getfile):
+                        print "No file!"
+                        sys.exit(1)
+                    for i in xrange(1, int(self.screensave) + 1):
+                        results = self.raw_cmd('wait-for-device', 'shell', 'dumpsys', 'gfxinfo', self.package, 'reset')
+                        print u"播放第%i 次中..." % i
+                        self.playatx(getfile, self.d, self.dm)
+                        if self.enableFPS != "no":
+                            result = self.gfxtest()
+                            if (result[0] != 0) & (result[2] != 0):
+                                frame_count = frame_count + result[0]
+                                jank_count = jank_count + result[1]
+                                fps = int(fps + result[2])
+                                draw_over = (draw_over + result[3])
+                                # print u"第" + str(i) + u"次帧速FPS: " + str(result[2]) + u" 绿色帧：" + str(
+                                #     result[3]) + "%" + " < cpu: " + str(self.cpu) + "%" + ", Memory: " + str(
+                                #     self.mem) + "M >"
+                            print u"第" + str(i) + u"次帧速FPS: " + str(result[2]) + u" 绿色帧：" + str(
+                                result[3]) + "%" + u" 总帧数: " + str(result[0]) + u", 丢帧数: " + str(result[1])
+                            # self.screenShot(
+                            # os.getcwd() + "/pic/" + self.package + str(i) + ".png")
+                    self.getLog(self.package)
+                elif self.scroll_xy == "m":
+                    time.sleep(1)
+                    raw_input("Press Enter key to swipe by manual: ")
+                    results = self.raw_cmd('wait-for-device', 'shell', 'dumpsys', 'gfxinfo', self.package, 'reset')
+                    # if not self.q.empty():
+                    #     if self.q.get_nowait()[0] == self.package:
+                    #         pqget = self.q.get_nowait()[1]
+                    #         self.mem = pqget.get("mem")
+                    #         self.cpu = pqget.get("cpu")
+                    #     self.cpu_max.append(self.cpu)
+                    time.sleep(int(self.screensave))
+                    i = 1
+                    result = self.gfxtest()
+                    if (result[0] != 0) & (result[2] != 0):
+                        frame_count = frame_count + result[0]
+                        jank_count = jank_count + result[1]
+                        fps = int(fps + result[2])
+                        draw_over = (draw_over + result[3])
+                    print u"第", i, u"次:", result[2], u" 绿色帧：" + str(result[3]) + u"%,总帧数: " + str(
+                        result[0]) + u", 丢帧数: " + str(result[3])
+                    self.screenShot(os.getcwd() + "/pic/" + self.package + str(datetime.datetime.now().second) + ".png")
+            else:
+                print u"<请打开选项:Settings/Developer/Profile GPU rendering->ON SCREEN AS BARS;并重新启动被测试应用>"
+                self.raw_cmd('wait-for-device', 'shell', 'setprop', 'debug.hwui.profile', 'visual_bars')  # visual_bars
+                self.raw_cmd('wait-for-device', 'shell',
+                             'monkey', '-p com.android.settings -c', 'android.intent.category.LAUNCHER', '1')
+                time.sleep(0.2)
+                self.raw_cmd('wait-for-device', 'shell', 'input', 'keyevent', '4')
+                time.sleep(0.2)
+                for m in xrange(0, 5):
+                    self.swipe2()
+                    result = self.gfxtest()
+                    if (result[0] != 0) & (result[2] != 0):
+                        i = i + 1
+                        frame_count = frame_count + result[0]
+                        jank_count = jank_count + result[1]
+                        fps = fps + result[2]
+                        draw_over = draw_over + result[3]
+                    print u"第", i, u"次:", result[2], u" 绿色帧：" + str(result[3]) + u"%, 总帧数: " + str(
+                        result[0]) + u", 丢帧数: " + str(result[1])
+
+            if i != 0:
+                fps = fps / i
+                draw_over = int((draw_over / i) / 0.75)
+                print "-" * 62
+                print str(i) + u" 次平均帧速:" + str(fps), u" 绿色帧:" + str(draw_over) + "%", u"; 总帧数:" + str(
+                    frame_count) + u",丢帧数:" + str(jank_count) + u",丢帧率:" + str(
+                    int((float(jank_count) / frame_count * 100))) + " %"
+                print "-" * 62
+                # assert (fps>51 & draw_over>=5), 'FPS<51 or Green >5%'
+        except Exception, e:
+            # import traceback
+            # traceback.print_exc()
+            print "\n,can not get data,try again or check the settings GPU mode!"
+        finally:
+            self.getLog(self.package)
+            return fps, draw_over
+
+    def killmonkey(self):
+        get = True
+        while get:
+            ps = Popen("adb  -s " + self.serial + " shell ps | find \"monkey\"", shell=True, stdout=PIPE, stderr=PIPE)
+            ps_line = ps.stdout.readline()
+            ps.communicate()
+            if len(ps_line) > 10:
+                pl = ' '.join(filter(lambda ps_line: ps_line, ps_line.split(' ')))
+                pid = pl.split(" ")[1]
+                ps = Popen("adb  -s " + self.serial + " shell kill " + pid, shell=True, stdout=PIPE, stderr=PIPE)
+                ps.communicate()
+            else:
+                get = False
+
+    def testLaunch(self, time=4, xy="100x200"):
+        try:
+            appdev = MinicapMin.TestDevice(**vars(self.options))
+            appstarttime = appdev.testAppStartTime(time, xy)
+        except Exception, e:
+            print "Exception!"
+            # import traceback
+            # traceback.print_exc()
+
+    def gettest(self):
+        print "*" * 64
+        print "* %-50s *" % ("Tinno Performance Test Tool 3.2.1").center(60)
+        print "* %-50s *" % ("CAMPAIGN:" + (self.campaign).upper()).center(60)
+        print "* %-50s *" % ("SERIAL:" + (self.serial)).center(60)
+        print "* %-50s *" % ("PACKAGE:" + (self.package).upper() + "_" + self.apkversion[0:10]).center(60)
+        print "* %-50s *" % ("Example:").center(60)
+        print "* %-60s *" % ("FPS test: gfxtest.exe")
+        print "* %-60s *" % ("FPS test direction left and right: gfxtest.exe -d h")
+        print "* %-60s *" % ("Start time and click 500x600: gfxtest -c start -x 500x600")
+        print "* %-60s *" % ("SimpleRecord 10s: gfxtest -d r -t 10")
+        print "* %-60s *" % ("SimplePlay 10 times: gfxtest -d p -t 10")
+        print "* %-60s *" % ("Record to file: gfxtest -d ra")
+        print "* %-60s *" % ("Play file: gfxtest -d pa")
+        print "*" * 64
+
+        if self.campaign == "start":
+            # self.raw_cmd('wait-for-device', 'shell', 'setprop', 'debug.hwui.profile', 'off',
+            #            stdout=subprocess.PIPE)  # visual_bars
+            # self.raw_cmd('wait-for-device', 'shell',
+            #              'monkey', '-p com.android.settings -c', 'android.intent.category.LAUNCHER', '1',
+            #              stdout=subprocess.PIPE )
+            # self.raw_cmd('wait-for-device', 'shell', 'input', 'keyevent', '3',
+            #              stdout=subprocess.PIPE)
+            self.testLaunch(self.screensave, self.xy)
+        elif self.campaign == "fps":
+            if self.platfrom_fps == "y":
+                self.platformRun2()
+            elif self.scroll_xy == "r":
+                self.record()
+            elif self.scroll_xy == "ra":
+                self.recordatx()
+            # elif self.scroll_xy == "p":
+            #     self.replay()
+            else:
+                self.testFPS()
+        self.cpu_flag = False
+
+    def record(self):
+        ref = raw_input("Input record file and press Enter to record..: ")
+        cmd = "wait-for-device shell /data/local/tmp/eventrec /sdcard/" + ref
+        try:
+            start = datetime.datetime.now()
+            process = subprocess.Popen(['adb', '-s', [self.serial], [cmd]])
+            while process.poll() is None:
+                time.sleep(1)
+                now = datetime.datetime.now()
+                if (now - start).seconds > int(self.screensave):
+                    os.kill(process.pid, signal.SIGTERM)
+                    return None
+        except KeyboardInterrupt:
+            print "save to file:", ref
+            self.raw_cmd('wait-for-device', 'pull', '/sdcard/' + ref, os.getcwd())  # visual_bars
+
+    def replay(self, pf):
+        start = datetime.datetime.now()
+        self.raw_cmd('wait-for-device', 'push', os.getcwd() + '/' + pf, '/sdcard/')
+        cmd = "wait-for-device shell /data/local/tmp/eventrec -p /sdcard/" + pf
+        process = subprocess.Popen(['adb', '-s', [self.serial], [cmd]])
+
+        while process.poll() is None:
+            time.sleep(1)
+            now = datetime.datetime.now()
+            du = now - start
+            if (du).seconds > 600:
+                try:
+                    process.terminate()
+                except Exception, e:
+                    return None
+
+    def grantPermission(self, pkg):
+        "dumpsys package com.ape.filemanager | grep granted=false"
+        self.raw_cmd('wait-for-device', 'shell', 'pm', 'grant', pkg,
+                     "android.permission.ACCESS_COARSE_LOCATION")
+        self.raw_cmd('wait-for-device', 'shell', 'pm', 'grant', pkg,
+                     "android.permission.READ_EXTERNAL_STORAGE")
+        self.raw_cmd('wait-for-device', 'shell', 'pm', 'grant', pkg,
+                     "android.permission.WRITE_EXTERNAL_STORAGE")
+        out = self.raw_cmd('wait-for-device', 'shell', 'pm', 'grant', pkg,
+                           "android.permission.READ_CONTACTS")
+        self.raw_cmd('wait-for-device', 'shell', 'pm', 'grant', pkg,
+                     "android.permission.WRITE_CONTACTS")
+        self.raw_cmd('wait-for-device', 'shell', 'pm', 'grant', pkg,
+                     "android.permission.CALL_PHONE")
+        self.raw_cmd('wait-for-device', 'shell', 'pm', 'grant', pkg,
+                     "android.permission.RECORD_AUDIO")
+        self.raw_cmd('wait-for-device', 'shell', 'pm', 'grant', pkg,
+                     "android.permission.READ_PHONE_STATE")
+
+        time.sleep(1)
+        out = \
+            self.raw_cmd('wait-for-device', 'shell', 'dumpsys', 'package', pkg,
+                         '| grep granted=false |cut -d \':\' -f 1')
+        if "permission" in out:
+            b = out.strip().split("\r")
+            print b
+            for i in b:
+                self.raw_cmd('wait-for-device', 'shell', 'pm', 'grant', pkg, i)
+
+    def calcufps(self, pkg):
+        fps = []
+        fps_avg = 0
+        result = self.gtest(pkg)
+        if (result[0] != 0) & (result[2] != 0):
+            fps.append(result[2])
+            if len(fps) > 3:
+                fps.remove(max(fps))
+                fps.remove(min(fps))
+            fps_avg = sum(fps) / len(fps)
+        return fps_avg
+
+    def platformRun2(self):
+        import ConfigParser
+        import glob
+        import csv
+        persistentmem = 0
+        persistent = self.raw_cmd('wait-for-device', 'shell', 'dumpsys', 'meminfo', '| grep -A 10 Persistent ')
+        # persistentmem = self.raw_cmd('wait-for-device', 'shell', 'dumpsys', 'meminfo','| grep Persistent |cut -d \':\' -f 1',
+        #                    stdout=subprocess.PIPE )
+        if "Persistent" in persistent:
+            persistentmem = persistent.split(":")[0]
+            if "K" in persistentmem:
+                persistentmem = persistentmem.replace("K", "")
+            if "," in persistentmem:
+                persistentmem = persistentmem.replace(",", "")
+                persistentmem = int(persistentmem) / 1024
+        print "" + persistent
+        memAv = self.raw_cmd('wait-for-device', 'shell', 'cat', '/proc/meminfo', '|grep MemAvailable')
+        if "kB" in memAv:
+            memAv = int(memAv.split(":")[1].strip().replace("kB", "").strip()) / 1024
+        print "Persistent:" + str(persistentmem) + " MB"
+        print "MemAvailable:" + str(memAv) + " MB"
+        cf = ConfigParser.ConfigParser()
+        try:
+            dsvf = "per_" + self.serial + "_" + str(datetime.datetime.now().hour) + "_" + str(
+                datetime.datetime.now().minute) + "_" + str(datetime.datetime.now().second) + ".csv"
+            with open(dsvf, 'ab+') as f:
+                writer = csv.writer(f)
+                writer.writerow(["Persistent", str(persistentmem), "MemAvailable", str(memAv) + " MB", "BuildVersion:",
+                                 self.buildversion])
+                writer.writerow(["package", "version", "starttime", "fps"])
+            for filename in glob.glob(os.getcwd() + '/lib/res/test_app/*.config'):
+                starttime = []
+                starttime_avg = 0
+                version = ""
+                cf.read(filename)
+                pkg = cf.get("package", "package")
+                acv = cf.get("package", "activity")
+                self.package = pkg
+                version, buildversion = self.getAPKVersion()
+                self.grantPermission(pkg)
+                try:
+                    for i in xrange(1, int(self.screensave) + 1):
+                        print filename, u" 执行 %i 次..." % i
+                        out = self.raw_cmd('wait-for-device', 'shell', 'am', 'start  -S -W', pkg + '/' + acv,
+                                           '|grep TotalTime|cut -d \':\' -f 2')
+                        time.sleep(1)
+                        out = out.strip()
+                        if out.isdigit():
+                            starttime.append(int(out))
+                            if len(starttime) > 3:
+                                starttime.remove(max(starttime))
+                                starttime.remove(min(starttime))
+                            starttime_avg = sum(starttime) / len(starttime)
+                        try:
+                            come_in = cf.get("package", "goto")
+                            if come_in != "":
+                                if "[" in come_in and "x" in come_in and "]" in come_in:
+                                    xy_x = come_in.replace("[", "")
+                                    xy_y = xy_x.replace("]", "")
+                                    xy_z = xy_y.split("x")
+                                    self.d.click(int(xy_z[0]), int(xy_z[1]))
+                                    time.sleep(1)
+                                else:
+                                    self.d(text=come_in).click()
+                                    time.sleep(1)
+                        except Exception, e:
+                            print "no goto section"
+
+                        self.gfxclean()
+                        if "ystemui" in pkg:
+                            self.swipesystemui()
+                        elif "etting" in pkg:
+                            self.swiptDown()
+                            self.swiptUp()
+                            fps_avg = self.calcufps(pkg)
+                            self.swiptDown()
+                            self.swiptUp()
+                            fps_avg = self.calcufps(pkg)
+                            self.swiptDown()
+                            self.swiptUp()
+                            fps_avg = self.calcufps(pkg)
+                        elif "ialer" in pkg:
+                            self.swiptDown()
+                            self.swiptUp()
+                            fps_avg = self.calcufps(pkg)
+                            self.swiptRight()
+                            self.swiptDown()
+                            self.swiptUp()
+                            fps_avg = self.calcufps(pkg)
+                            self.swiptRight()
+                            self.swiptDown()
+                            self.swiptUp()
+                            fps_avg = self.calcufps(pkg)
+                        elif "alculator" in pkg:
+                            self.swiptUp()
+                            self.swiptDown()
+                            fps_avg = self.calcufps(pkg)
+                            self.swiptRight()
+                            self.swiptUp()
+                            self.swiptDown()
+                            fps_avg = self.calcufps(pkg)
+                            self.swiptLeft()
+                            self.swiptUp()
+                            self.swiptDown()
+                            fps_avg = self.calcufps(pkg)
+                        else:
+                            self.swiptDown()
+                            self.swiptUp()
+                            fps_avg = self.calcufps(pkg)
+                            self.swiptDown()
+                            self.swiptUp()
+                            fps_avg = self.calcufps(pkg)
+                            self.swiptDown()
+                            self.swiptUp()
+                            fps_avg = self.calcufps(pkg)
+
+                        print u"第" + str(i) + u"次<" + pkg + ">" + u"帧速FPS: " + str(fps_avg) + u" 启动时间：" + str(
+                            starttime_avg)
+                    with open(dsvf, 'ab+') as f:
+                        writer = csv.writer(f)
+                        writer.writerow([pkg, version, starttime_avg, fps_avg])
+                except Exception, e:
+                    pass
+                finally:
+                    self.raw_cmd('wait-for-device', 'shell', 'am', 'force-stop', pkg)
+            self.getLog(pkg)
+        except Exception, e:
+            pass
+            # import traceback
+            # traceback.print_exc()
+
+    def platformRun3(self):
+        import ConfigParser
+        import csv
+        cf = ConfigParser.ConfigParser()
+        try:
+            dsvf = "per_" + str(datetime.datetime.now().hour) + "_" + str(datetime.datetime.now().second) + ".csv"
+            with open(dsvf, 'ab+') as f:
+                writer = csv.writer(f)
+                writer.writerow(["package", "version", "starttime", "fps"])
+                out = \
+                    self.raw_cmd('wait-for-device', 'shell', 'pm list package ').communicate()[
+                        0]
+
+            pkg = ""
+            for k in (out.strip().split("\r")):
+                starttime = []
+                starttime_avg = 0
+                fps = []
+                fps_avg = 0
+                version = ""
+                pkg = k[k.find("com"):]
+                self.package = pkg
+                lout = \
+                    self.raw_cmd('wait-for-device', 'shell',
+                                 'dumpsys package ' + pkg + "|grep android.intent.category.LAUNCHER")
+                if not "android.intent.category.LAUNCHER" in lout:
+                    continue
+                version = self.getAPKVersion()
+                if "com.android" in pkg or "com.ape" in pkg or "com.myos" in pkg:
+                    for i in xrange(1, int(self.screensave) + 1):
+                        print  u" 执行 %i 次..." % i
+                        self.raw_cmd('wait-for-device', 'shell', 'am', 'force-stop', pkg)
+                        time.sleep(2)
+                        out = self.raw_cmd('wait-for-device', 'shell', 'am', 'start -W', pkg,
+                                           '|grep TotalTime|cut -d \':\' -f 2')
+                        time.sleep(1)
+                        out = out.strip()
+                        self.swipe12()
+                        result = self.gtest(pkg)
+                        if (result[0] != 0) & (result[2] != 0):
+                            fps.append(result[2])
+                            if len(fps) > 3:
+                                fps.remove(max(fps))
+                                fps.remove(min(fps))
+                            fps_avg = sum(fps) / len(fps)
+                        if out.isdigit():
+                            starttime.append(int(out))
+                            if len(starttime) > 3:
+                                starttime.remove(max(starttime))
+                                starttime.remove(min(starttime))
+                            starttime_avg = sum(starttime) / len(starttime)
+                        self.raw_cmd('wait-for-device', 'shell', 'am', 'force-stop', pkg)
+                        print u"第" + str(i) + u"次<" + pkg + ">" + u"帧速FPS: " + str(fps_avg) + u" 启动时间：" + str(
+                            starttime_avg)
+                    with open(dsvf, 'ab+') as f:
+                        writer = csv.writer(f)
+                        writer.writerow([pkg, version, starttime_avg, fps_avg])
+        except Exception, e:
+            import traceback
+            traceback.print_exc()
+
+    def killsh(self):
+        ps_line = self.raw_cmd('wait-for-device', 'shell', 'cat', '/data/local/tmp/FPS.pid')
+        if len(ps_line) > 0:
+            pid = ps_line.strip()
+            self.raw_cmd('wait-for-device', 'shell', 'kill', str(pid))
+        time.sleep(1)
+
+    def get_battery(self):
+        output = self.raw_cmd('wait-for-device', 'shell', 'dumpsys battery')
+        battery2 = int(re.findall("level:.(\d+)*", output, re.S)[0])
+        print battery2
+
+    def get_cpuT(self):
+        cpu = 0
+        mem = 0
+        try:
+            d = threading.Thread(target=self.cpuThreading)
+            d.setDaemon(True)
+            d.start()
+        except Exception, e:
+            # import traceback
+            # traceback.print_exc()
+            pass
+
+    def cpuThreading(self):
+        cpu = 0
+        mem = 0
+        try:
+            while (self.cpu_flag):
+                time.sleep(2)
+                pkg = self.getPackage()
+                cmd = "wait-for-device shell top -n 1 | grep %s" % (pkg[:13])
+                process = subprocess.Popen(['adb', '-s', [self.serial], [cmd]], stdout=PIPE, stderr=PIPE)
+                output = process.stdout.readline()
+                mem = int(float(self.getMemInfo(pkg)))
+                if pkg[:13] in output:
+                    sdkout = self.raw_cmd('wait-for-device', 'shell', 'getprop', 'ro.build.version.sdk')
+                    sdk = int(sdkout.strip())
+                    if sdk < 26:
+                        cpu = int(float((output[output.find("%") - 2:output.find("%")]).strip()))
+                    else:
+                        cpu = int(float((output[output.find("S") + 1:output.find("S") + 7]).strip()))
+                # print pkg, cpu, mem
+                self.q.put([pkg, {"cpu": cpu, "mem": mem}])
+                # print pkg + "[ CPU: " + str((cpu)) + "%, Memory:" + str(int(float(self.mem))), "M ]"
+        except Exception, e:
+            # import traceback
+            # traceback.print_exc()
+            pass
+        finally:
+            return mem, cpu
+
+    def getMemInfo(self, pkg):
+        try:
+            memJava = []
+            memSystem = []
+            memPrivate = []
+            memTotal3 = []
+            memJava3 = []
+            memNative3 = []
+            memNative = []
+            memGraphics = []
+            memTotal = []
+            memCode = []
+            memStack = []
+            getmemory = "adb -s " + self.serial + " shell \"dumpsys meminfo --package " + pkg + " | grep -A 55 \\[" + \
+                        pkg + "\\] | grep -E '(TOTAL:)|(Java Heap:)|(Native Heap:)|(Code:)|(Stack:)|(Graphics:)|(Private Other:)|(System:)'\""
+            pm = Popen(getmemory, shell=True, stdout=PIPE, stderr=PIPE)
+            readlins = pm.stdout.readlines()
+            if len(readlins) >= 7:
+                readlin = readlins[-8:]
+                for i in xrange(0, len(readlin)):
+                    if "Java Heap" in readlin[i]:
+                        javaheap = readlin[i].split(":")[1].strip(" ").strip("\r\n")
+                        javaheap = round(int(re.findall(r'\d+', javaheap)[0]) / 1024.0, 2)
+                        memJava.append(javaheap)
+                    elif "Native Heap" in readlin[i]:
+                        nativeheap = readlin[i].split(":")[1].strip(" ").strip("\r\n")
+                        nativeheap = round(int(re.findall(r'\d+', nativeheap)[0]) / 1024.0, 2)
+                        memNative.append(nativeheap)
+
+                    elif "TOTAL:" in readlin[i]:
+                        memtotal = readlin[i].split(":")[1].strip(" ").strip("\r\n")
+                        memtotal = round(int(re.findall(r'\d+', memtotal)[0]) / 1024.0, 2)
+                        memTotal.append(memtotal)
+                    elif "Code:" in readlin[i]:
+                        code = readlin[i].split(":")[1].strip(" ").strip("\r\n")
+                        code = round(int(re.findall(r'\d+', code)[0]) / 1024.0, 2)
+                        memCode.append(code)
+
+                    elif "Stack:" in readlin[i]:
+                        stack = readlin[i].split(":")[1].strip(" ").strip("\r\n")
+                        stack = round(int(re.findall(r'\d+', stack)[0]) / 1024.0, 2)
+                        memStack.append(stack)
+
+                    elif "Graphics:" in readlin[i]:
+                        graphics = readlin[i].split(":")[1].strip(" ").strip("\r\n")
+                        graphics = round(int(re.findall(r'\d+', graphics)[0]) / 1024.0, 2)
+                        memGraphics.append(graphics)
+
+                    elif "Private:" in readlin[i]:
+                        private = readlin[i].split(":")[1].strip(" ").strip("\r\n")
+                        private = round(int(re.findall(r'\d+', private)[0]) / 1024.0, 2)
+                        memPrivate.append(private)
+
+                    elif "System:" in readlin[i]:
+                        system = readlin[i].split(":")[1].strip(" ").strip("\r\n")
+                        system = round(int(re.findall(r'\d+', system)[0]) / 1024.0, 2)
+                        memSystem.append(system)
+
+                if len(memTotal) > 0:
+                    m = memTotal
+                    x = [float(m) for m in m if m]
+                    av = 0
+                    if len(x) > 0:
+                        memTotal3.append(max(x))
+                        memTotal3.append(min(x))
+                        mt = len(x)
+                        ma = sum(x)
+                        av = round(ma / mt, 2)
+                    memTotal3.append(av)
+                if len(memJava) > 0:
+                    m = memJava
+                    x = [float(m) for m in m if m]
+                    av = 0
+                    if len(x) > 0:
+                        memJava3.append(max(x))
+                        memJava3.append(min(x))
+                        mt = len(x)
+                        ma = sum(x)
+                        av = round(ma / mt, 2)
+                    memJava3.append(av)
+
+                if len(memNative) > 0:
+                    m = memNative
+                    x = [float(m) for m in m if m]
+                    av = 0
+                    if len(x) > 0:
+                        memNative3.append(max(x))
+                        memNative3.append(min(x))
+                        mt = len(x)
+                        ma = sum(x)
+                        av = round(ma / mt, 2)
+                    memNative3.append(av)
+                    # print self.memTotal, memJava, self.memNative,memTotal3,memJava3,memNative3,self.memCode,self.memStack,self.memGraphics,memPrivate,memSystem
+        except Exception, e:
+            print e
+        finally:
+            # print "mem:",memTotal3
+            # return self.memTotal, memJava, self.memNative, memTotal3, memJava3, memNative3, self.memCode, self.memStack, self.memGraphics, memPrivate, memSystem
+            if len(memTotal3) > 0:
+                return str(memTotal3[0])
+            else:
+                return 0
+
+    def tomd5(self, node):
+        # act = self.getActivity()
+        # t = ""
+        # if len(node) > 10:
+        #     nodelen = 6
+        # else:
+        #     nodelen = len(node)
+        # for i in xrange(1, nodelen):
+        #     t = str(node[i].bounds) + str(node[i].text) + t
+        return hashlib.md5(str(node)).hexdigest()
+
+    def _parse_xml_node(self, node):
+        # ['bounds', 'checkable', 'class', 'text', 'resource_id', 'package']
+        __alias = {
+            'class': 'class_name',
+            'resource-id': 'resource_id',
+            'content-desc': 'content_desc',
+            'long-clickable': 'long_clickable',
+        }
+
+        def parse_bounds(text):
+            m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', text)
+            if m is None:
+                return None
+            return Bounds(*map(int, m.groups()))
+
+        def str2bool(v):
+            return v.lower() in ("yes", "true", "t", "1")
+
+        def convstr(v):
+            return v.encode('utf-8')
+
+        parsers = {
+            'bounds': parse_bounds,
+            'text': convstr,
+            'class_name': convstr,
+            'resource_id': convstr,
+            'package': convstr,
+            'checkable': str2bool,
+            'scrollable': str2bool,
+            'focused': str2bool,
+            'clickable': str2bool,
+            'enabled': str2bool,
+            'selected': str2bool,
+            'long_clickable': str2bool,
+            'focusable': str2bool,
+            'password': str2bool,
+            'index': int,
+            'content_desc': convstr,
+        }
+        ks = {}
+        for key, value in node.attributes.items():
+            key = __alias.get(key, key)
+            f = parsers.get(key)
+            if value is None:
+                ks[key] = None
+            elif f:
+                ks[key] = f(value)
+        for key in parsers.keys():
+            ks[key] = ks.get(key)
+        ks['xml'] = node
+
+        return UINode(**ks)
+
+    def dumnode(self):
+        try:
+            allmd5 = ""
+            xy = {}
+            nodehas = []
+            canbeclick = ["android.widget.Button", "android.widget.TextView", "android.widget.ImageButton",
+                          "android.widget.ImageView", "android.widget.CompoundButton"]
+            cannotbeclick = ["USB tethering", "reset", "RESET", "Factory data reset", "Start now", "Navigate up",
+                             "USB connected, check to tether"]
+            out = self.raw_cmd('wait-for-device', 'shell', '/system/bin/uiautomator ', 'dump', '--compressed',
+                               '/sdcard/gfxtest.xml')
+            time.sleep(0.2)
+            xmldata = self.raw_cmd('wait-for-device', 'shell', 'cat', '/sdcard/gfxtest.xml')
+            dom = xml.dom.minidom.parseString(xmldata)
+            root = dom.documentElement
+            nodes = root.getElementsByTagName('node')
+            ui_nodes = []
+            allnode = ""
+
+            for node in nodes:
+                ui_nodes.append(self._parse_xml_node(node))
+            nodecount = len(ui_nodes)
+            for i in xrange(nodecount):
+                if ui_nodes[i].class_name in canbeclick:
+                    # if (("ALLOW" ==ui_nodes[i].text) and(ui_nodes[i].class_name=="android.widget.Button")):
+                    #     self.permissionClick(ui_nodes[i].bounds.center)
+                    if (ui_nodes[i].text not in cannotbeclick) & (ui_nodes[i].content_desc not in cannotbeclick):
+                        clickmd5 = self.tomd5(
+                            ui_nodes[i].class_name + ui_nodes[i].content_desc + ui_nodes[i].resource_id + str(
+                                ui_nodes[i].bounds.center))
+                        # self.blacklist.append(clickmd5)
+                        # allnode = allnode + ";" + ui_nodes[i].class_name + "," + ui_nodes[i].content_desc + "," + \
+                            #           ui_nodes[i].resource_id + "," + str(ui_nodes[i].bounds.center)
+                        allnode = allnode + ";" + ui_nodes[i].class_name + \
+                                      ui_nodes[i].resource_id + "," + str(ui_nodes[i].bounds.center)
+                        xy[clickmd5] = ui_nodes[i].bounds.center
+            allmd5 = self.tomd5(allnode)
+            if allmd5 not in self.md5list:
+                self.md5list.append(allmd5)
+        except Exception, e:
+            pass
+        finally:
+            return allmd5, xy, allnode
+
+    def travel2(self, pkg):
+        try:
+            clicklist = {}
+            blacklist = {}
+
+            nomd, xy, an = self.dumnode()
+            perkey = []
+            runtflat = True
+            while ("packageinstaller" in an) or ("android:id/alertTitle" in an):
+                for p in xrange(6):
+                    for pi in xy.keys():
+                        perkey.append(xy.get(pi))
+                self.permissionClick(max(perkey))
+                nomd, xy, an = self.dumnode()
+
+            base = xy
+            nomdo = nomd
+            ct = 0
+            timeNow = time.time()
+            packagenow = pkg
+            while (ct <= int(590) and (len(xy) > 0) and runtflat):
+                ct = time.time() - timeNow
+                ky = xy.keys()[random.randint(0, len(xy) - 1)]
+                cxy = xy.pop(ky)
+                if (ky not in blacklist):
+                    if (ky in clicklist):
+                        clicklist[ky] = clicklist[ky] + 1
+                    else:
+                        clicklist[ky] = 1
+                    if (clicklist[ky]) < 10:
+                        self.raw_cmd('wait-for-device', 'shell', ' input', 'tap', str(cxy[0]),
+                                     str(cxy[1]))
+                    packagenow = self.getPackage()
+                    if pkg not in packagenow:
+                        blacklist[ky] = cxy
+                        if pkg != "":
+                            self.raw_cmd('wait-for-device', 'shell', 'am', 'force-stop', pkg)
+                        self.raw_cmd('wait-for-device', 'shell', 'input', 'keyevent', '3')
+                        self.raw_cmd('wait-for-device', 'shell',
+                                     'monkey', '-p', pkg, '-c', 'android.intent.category.LAUNCHER', '1')
+                    time.sleep(1)
+                    nomdn, xy, an = self.dumnode()
+                    if nomdn == nomdo:
+                        blacklist[ky] = cxy
+                        continue
+                    else:
+                        nomdo = nomdn
+                inter = dict.fromkeys([x for x in base if x in blacklist])
+                df = list(set(base.keys()).difference(set(inter.keys())))
+                if (df == []):
+                    # print  pkg + "-->over!"
+                    break
+                elif len(xy) == 0:
+                    if pkg != "":
+                        self.raw_cmd('wait-for-device', 'shell', 'am', 'force-stop', pkg)
+                    time.sleep(0.2)
+                    self.raw_cmd('wait-for-device', 'shell',
+                                 'monkey', '-p', pkg, '-c', 'android.intent.category.LAUNCHER', '1')
+                    time.sleep(1)
+                    nomdn, xy, an = self.dumnode()
+                    runtflat = False
+                    self.raw_cmd('wait-for-device', 'shell', 'input', 'keyevent', '4')
+                    self.raw_cmd('wait-for-device', 'shell', 'input', 'keyevent', '3')
+                    print  pkg + "-->End!"
+        except Exception, e:
+            self.cpu_flag = False
+            # import traceback
+            # traceback.print_exc()
+        finally:
+            self.cpu_flag = False
+
+    def permissionClick(self, xy):
+        os.system('adb -s ' + self.serial + " wait-for-device shell input tap " + str(xy[0]) + " " + str(xy[1]))
+        time.sleep(0.2)
+
+    def coverfile(self):
+        inputevent = self.getpad()
+        orx = 480
+        ory = 960
+        nowx = self.WIDTH
+        nowy = self.HEIGHT
+        x = 0
+        y = 0
+        with open('a.txt', 'a+') as f:
+            lines = f.read()
+        with open('b.txt', 'w') as f:
+            for line in lines.split("\n"):
+                if line != "":
+                    line = line.replace(line[line.find("/dev/input"):line.find(":")], inputevent)
+                    if "0035" == line.split()[4]:
+                        x = line.split()[5]
+                        print "ox:", x
+                        x = int(str('0x' + x), 16)  # 16 to 10
+                        if orx > nowx:
+                            x = int(x) * orx / nowx
+                        else:
+                            x = int(x) * nowx / orx
+                        x = hex(x)
+                        x = str(x).split("0x")[1].zfill(8)
+                        print "nx:", x
+
+                        f.write(line[:-8] + x + "\n")
+                    elif "0036" == line.split()[4]:
+                        y = line.split()[5]
+                        print "oy:", y
+                        y = int(str('0x' + y), 16)  # 16 to 10
+                        if ory > nowy:
+                            y = int(y) * ory / nowy
+                        else:
+                            y = int(y) * nowy / ory
+                        y = hex(y)
+                        y = str(y).split("0x")[1].zfill(8)
+                        print "oy:", y
+                        f.write(line[:-8] + y + "\n")
+                    else:
+                        f.write(line + "\n")
+
+    def getpad(self):
+        try:
+            out = self.raw_cmd('wait-for-device', 'shell', 'getevent -p  | grep -B 15 \"0035\"')
+            outl = out.split("\n")
+            inputevent = ""
+            for i in xrange(len(outl)):
+                if len(outl) > 0:
+                    outlo = outl[-1]
+                    if "/dev/input/event" in outlo:
+                        inputevent = outlo[outlo.find("/dev/input"):]
+                        inputevent = inputevent.strip()
+                        break
+                    else:
+                        if len(outl) > 0:
+                            outl.remove(outl[-1])
+        except Exception, e:
+            pass
+        finally:
+            return inputevent
+
+    def recordatx(self):
+        try:
+            getfile = raw_input("Please input save file name: ")
+            if getfile == "":
+                print "Please input the record file name!"
+                sys.exit(1)
+            if os.path.isfile(os.getcwd() + "/" + getfile):
+                os.remove(os.getcwd() + "/" + getfile)
+            p = subprocess.Popen(['adb', '-s', self.serial, 'shell', 'getevent', '-l'], stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE)
+
+            self.recordmain(p.stdout, getfile)
+            # while(True):
+            #     print  p.stdout.readline()
+            #     time.sleep(1)
+        except KeyboardInterrupt:
+            p.kill()
+        finally:
+            print "save to file!"
+
+    def recordmain(self, pipe, filename):
+        xs, ys = [], []
+        lastOper = ''
+        touchStart = 0
+        start = time.time()
+        begin = time.time()
+        DEVSCREEN = self.getpad()
+
+        def record(fmt, *args):
+            outstr = fmt % args
+            if filename:
+                with open(filename, 'a+') as file:
+                    file.write(outstr + '\n')
+
+        record('display:' + str(self.WIDTH) + '_' + str(self.HEIGHT))
+        while True:
+            line = pipe.readline()
+            if not line.startswith(DEVSCREEN):
+                continue
+            channel, event, oper, value = line.split()
+            # print value#int(value, 16)
+            if "DOWN" in value:
+                continue
+            else:
+                # if oper == 'SYN_REPORT':
+                #     continue
+                if oper == 'ABS_MT_POSITION_X':
+                    value = int(value, 16)
+                    xs.append(value)
+                elif oper == 'ABS_MT_POSITION_Y':
+                    value = int(value, 16)
+                    ys.append(value)
+                elif value == 'UP' or oper == "SYN_REPORT":
+                    if 1 == 1:
+                        # xs = map(lambda x: x / self.WIDTH, xs)
+                        # ys = map(lambda y: y / self.HEIGHT, ys)
+                        if len(xs) != 0 and len(ys) != 0:  # every thing is OK
+                            (x1, y1), (x2, y2) = (xs[0], ys[0]), (xs[-1], ys[-1])
+                            dist = ((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1)) ** 0.5
+
+                            duration = time.time() - touchStart
+                            # touch up
+                            if dist < 50:
+                                print "click:", x1, y1
+                                record('clickscreen:%dx%d', x1, y1)
+                            else:
+                                print "drag:", x1, y1, x2, y2
+                                record('drag:%d, %d, %d, %d,30', x1, y1, x2, y2)
+                        xs, ys = [], []
+                    else:
+                        if len(xs) == 1:
+                            # touch down
+                            record('app.sleep(%.2f)', float(time.time() - start))
+                            start = time.time()
+                            touchStart = time.time()
+                lastOper = oper
+
+    def playatx(self, playfile, device, devicemin):
+        playscreenx = self.WIDTH
+        playscreeny = self.HEIGHT
+        restricscreen = self.getShape()
+        resx = restricscreen[0]
+        resy = restricscreen[1]
+        d = device
+
+        if playfile == "":
+            print "no play file!"
+            sys.exit(1)
+        try:
+            with open(playfile, 'a+') as f:
+                lines = f.read()
+                for line in lines.split("\n"):
+                    if line != "":
+                        if "display:" in line:
+                            playscreenx = int(line.split(":")[1].split("_")[0])
+                            playscreeny = int(line.split(":")[1].split("_")[1])
+                        elif "clickscreen" in line:
+                            par = line.split(":")[1]
+                            x = int(par.split("x")[0])
+                            y = int(par.split("x")[1])
+                            # print playscreenx,playscreeny
+                            if playscreenx > self.WIDTH:
+                                x = int(x) * playscreenx / self.WIDTH
+                            else:
+                                x = int(x) * self.WIDTH / playscreenx
+                            if playscreeny > self.HEIGHT:
+                                y = int(y) * playscreeny / self.HEIGHT
+                            else:
+                                y = int(y) * self.HEIGHT / playscreeny
+                            # print int(x),int(y),resx,resy
+                            if int(y) > int(resy):
+                                if (int(x)) < self.WIDTH / 3:
+                                    d.press.back()
+                                    time.sleep(1)
+                                elif (int(x)) > self.WIDTH * 0.7:
+                                    d.press.recent()
+                                    time.sleep(1)
+                                else:
+                                    d.press.home()
+                                    time.sleep(1)
+                            else:
+                                d.click(x, y)
+                                time.sleep(1)
+                        elif "drag" in line or "swipe" in line:
+                            par = line.split(":")[1]
+                            x = int(par.split(",")[0])
+                            y = int(par.split(",")[1])
+                            x1 = int(par.split(",")[2])
+                            y1 = int(par.split(",")[3])
+
+                            if playscreenx > self.WIDTH:
+                                x = int(x) * playscreenx / self.WIDTH
+                                x1 = int(x1) * playscreenx / self.WIDTH
+                            else:
+                                x = int(x) * self.WIDTH / playscreenx
+                                x1 = int(x1) * self.WIDTH / playscreenx
+                            if playscreeny > self.HEIGHT:
+                                y = int(y) * playscreeny / self.HEIGHT
+                                y1 = int(y1) * playscreeny / self.HEIGHT
+                            else:
+                                y = int(y) * self.HEIGHT / playscreeny
+                                y1 = int(y1) * playscreeny / self.HEIGHT
+                            if "drag" in line:
+                                d.drag(x, y, x1, y1, 30)
+                            else:
+                                d.swipe(x, y, x1, y1, 30)
+
+                        elif "checktext" in line:
+                            x = line.split(":")[1]
+                            p = d(text=x).wait.exists(timeout=5000)
+                            if p:
+                                self.logger.info("Text <" + x + ">" + " < Found!>")
+                                d.screenshot(
+                                    "pic/checktext_f_" + time.strftime("%m%d%H%M%S", time.localtime()) + ".png")
+
+                            else:
+                                self.logger.error("<" + x + ">" + " < Not Found!>")
+                                d.screenshot(
+                                    "pic/checktext_nf_" + time.strftime("%m%d%H%M%S", time.localtime()) + ".png")
+
+                        elif "checkimage" in line:
+                            x = line.split(":")[1]
+                            getORno = devicemin.wait(x, timeout=10)
+                            if getORno == None:
+                                self.logger.error("<" + x + ">" + " < Not Found! >")
+                                d.screenshot(
+                                    "pic/checkimage_nf_" + time.strftime("%m%d%H%M%S", time.localtime()) + ".png")
+                            elif getORno.matched:
+                                self.logger.info("Image <" + x + ">" + " < Found at: " + str(getORno[0]) + ">")
+                                d.screenshot(
+                                    "pic/checkimage_f_" + time.strftime("%m%d%H%M%S", time.localtime()) + ".png")
+
+                        elif "ocrtext" in line:
+                            self.screenShot(os.getcwd())
+                            x = line.split(":")[1]
+                            result = MYOCRTest.repara()
+                            print result
+                            for i in xrange(len(result)):
+                                if x[1:-1] in result[i].get("words"):
+                                    self.logger.info("<" + x + ">" + " < Found! >")
+                                    break
+                                elif i == len(result) - 1:
+                                    self.logger.info("<" + x + ">" + " < Not Found! >")
+                                    d.screenshot(
+                                        "pic/ocrtext_nf_" + time.strftime("%m%d%H%M%S", time.localtime()) + ".png")
+
+                        elif "ocrface" in line:
+                            print u"人脸识别"
+                            MYOCRTest.repface()
+
+                        elif "sleep" in line:
+                            if ":" in line:
+                                x = line.split(":")[1]
+                                time.sleep(int(x))
+                            else:
+                                time.sleep(1)
+
+                        elif "pressback" in line:
+                            d.press.back()
+
+                        elif "reboot" in line:
+                            self.raw_cmd('wait-for-device', 'shell', 'reboot')
+                            time.sleep(30)
+                            out = self.raw_cmd('wait-for-device', 'shell', 'get-state')
+                            if "device" in out:
+                                print "reboot ok"
+
+                        elif "presshome" in line:
+                            d.press.home()
+
+                        elif "clicktext" in line:
+                            x = line.split(":")[1]
+                            d(text=x).click()
+
+                        elif "clickimage" in line:
+                            x = line.split(":")[1]
+                            getORno = devicemin.wait(x, timeout=12)
+                            if getORno == None:
+                                self.logger.error("<" + x + ">" + " < Not Found! >")
+                                d.screenshot(
+                                    "pic/imagenotfound_" + time.strftime("%m%d%H%M%S", time.localtime()) + ".png")
+                            elif getORno.matched:
+                                d.click(getORno[0][0], getORno[0][1])
+                                time.sleep(1)
+                                self.logger.info("Image <" + x + ">" + " < Found at: " + str(getORno[0]) + ">")
+
+        except Exception, e:
+            # out = self.raw_cmd('wait-for-device', 'kill-server')
+            # out = self.raw_cmd('wait-for-device', 'start-server')
+            # print e.message
+            pass
+
+    def getPackageAllActivitys(self, pkg):
+        pkgs = []
+        cmds = 'dumpsys package ' + pkg + '| grep ' + pkg + '/'
+        out = self.shell_cmd(cmds)
+        for i in out.split("\n"):
+            j = i.split()
+            if len(j) > 1:
+                if "/." in j[1] or "/com" in j[1]:
+                    k = j[1]
+                    if "}" in k:
+                        k = k.replace("}", "")
+                    elif "{" in k:
+                        k = k.replace("{", "")
+                    if "/." in k:
+                        act = pkg + k.split("/")[1]
+                    else:
+                        act = k.split("/")[1]
+                    pkgs.append(act)
+        return pkgs
+
+    def getCurrentActivitys(self):
+        out = self.shell_cmd('getprop ro.build.version.sdk')
+        sdk = int(out.strip())
+        if sdk < 26:
+            getp = self.shell_cmd('dumpsys activity |grep mFocusedActivity')
+        else:
+            getp = self.shell_cmd('dumpsys activity |grep mResumedActivity')
+        out = self.shell_cmd('')
+        start = getp.find("com")
+        end = getp.find('}')
+        package = getp[start:end].strip().split()[0]  # 'com.ape.launcher/com.myos.MyosLauncher'
+        activity = package.split("/")[1]  # 'com.myos.MyosLauncher'
+        if "/." in package:
+            activity = package.split("/")[0] + activity
+
+        # apkversion = self.raw_cmd('wait-for-device', 'shell', 'dumpsys', "package", package, "|", "grep",'versionName', '|head -n 1')
+        return activity
+
+    def getShape(self):
+        rsRE = re.compile('\s*mRestrictedScreen=\(\d+,\d+\) (?P<w>\d+)x(?P<h>\d+)')
+        for line in subprocess.check_output('adb -s ' + self.serial + ' shell dumpsys window', shell=True).splitlines():
+            m = rsRE.match(line)
+            if m:
+                return m.groups()
+        raise RuntimeError('Couldn\'t find mRestrictedScreen in dumpsys')
+
+    def shell_cmd(self, cmd):
+        cmds = 'adb ' + ' -s ' + self.serial + ' wait-for-device shell ' + "\"" + cmd + "\""
+        return os.popen(cmds).read()
+
+    def travelApp(self, pkg):
+        try:
+            clicklist = {}
+            blacklist = {}
+            allActivits = self.getPackageAllActivitys(pkg)
+            for p in allActivits:
+                clicklist[p] = []
+            perkey = []
+            runtflat = True
+            self.shell_cmd('am force-stop ' + pkg)
+            self.shell_cmd('input keyevent 4')
+            self.shell_cmd('input keyevent 4')
+            self.shell_cmd('input keyevent 4')
+            self.raw_cmd('wait-for-device', 'shell',
+                         'monkey', '-p', pkg, '-c', 'android.intent.category.LAUNCHER', '1')
+
+            time.sleep(1)
+            nomd, xy, an = self.dumnode()
+            if pkg not in self.getPackage():
+                for pi in xy.keys():
+                    perkey.append(xy.get(pi))
+                for i in xrange(0, 6):
+                    if pkg not in self.getPackage():
+                        self.permissionClick(max(perkey))
+            time.sleep(2)
+            nomd, xy, an = self.dumnode()
+            base = xy
+            nomdo = nomd
+            ct = 0
+            timeNow = time.time()
+            packagenow = pkg
+            activityOld = self.getCurrentActivitys()
+            while (ct <= int(590) and (len(xy) > 0) and runtflat):
+                ct = time.time() - timeNow
+                ky = xy.keys()[random.randint(0, len(xy) - 1)]  # point "md5":"100x200",ky is key
+                cxy = xy.pop(ky)  # point "md5":"100x200",cxy is value
+                os.system(
+                    'adb -s ' + self.serial + " wait-for-device shell input tap " + str(cxy[0]) + " " + str(cxy[1]))
+                time.sleep(0.2)
+                nomdn, xy, an = self.dumnode()
+                activityNow = self.getCurrentActivitys()
+                if cxy not in clicklist[activityOld]:
+                    clicklist[activityOld].append(ky)
+
+                if activityNow not in allActivits:
+                    clicklist[ky] = cxy
+                    self.shell_cmd('input keyevent 4')
+                    if self.getCurrentActivitys() not in allActivits:
+                        self.shell_cmd('input keyevent 4')
+                    if self.getCurrentActivitys() not in allActivits:
+                        self.shell_cmd('input keyevent 4')
+                    if self.getCurrentActivitys() not in allActivits:
+                        self.raw_cmd('wait-for-device', 'shell',
+                                     'monkey', '-p', pkg, '-c', 'android.intent.category.LAUNCHER', '1')
+                else:
+                    if activityOld != activityNow:  # come to new activity
+                        if cxy in clicklist[activityOld]:
+                            clicklist[activityOld].remove(cxy)
+                        activityOld = activityNow
+
+
+
+        except Exception, e:
+            self.cpu_flag = False
+            # import traceback
+            # traceback.print_exc()
+        finally:
+            self.cpu_flag = False
+
+
+if __name__ == "__main__":
+    test = GFXTest()
+    # test.get_cpuT()
+    test.gettest()
+    #test.travelApp("com.android.settings")
+    # test.grantPermission("com.myos.camera")
+    # test.platformRun2()
+    # test.travel2("com.qiku.smartkey")
+    # test.recordatx()

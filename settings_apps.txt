@@ -1,0 +1,7 @@
+clicktext:Apps & notifications
+sleep:1
+checkimage:E:/work/GFXTest/icon/pic/wiko_settings_5_Apps_Advanced.720x1512.png
+checkimage:E:/work/GFXTest/icon/pic/wiko_settings_5_Apps_Apppermissions.720x1512.png
+checkimage:E:/work/GFXTest/icon/pic/wiko_settings_5_Apps_Notifications.720x1512.png
+pressback:1
+

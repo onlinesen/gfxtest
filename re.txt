@@ -1,0 +1,9 @@
+reboot
+shell:input text 1
+shell:input text 2
+shell:input text 3
+shell:input text 4
+shell:input keyevent 66
+sleep:5
+checktext:Settings
+

@@ -1,0 +1,10 @@
+clicktext:Display
+sleep:1
+checkimage:E:/work/GFXTest/icon/pic/wiko_settings_7_Display_Advanced.720x1512.png
+checkimage:E:/work/GFXTest/icon/pic/wiko_settings_7_Display_Brightnesslevel.720x1512.png
+checkimage:E:/work/GFXTest/icon/pic/wiko_settings_7_Display_NightLight.720x1512.png
+drag:400,600,400,200
+checkimage:E:/work/GFXTest/icon/pic/wiko_settings_7_Display_Notch.720x1512.png
+pressback:1
+
+
